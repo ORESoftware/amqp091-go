@@ -42,12 +42,19 @@ type consumers struct {
 
 	sync.Mutex // protects below
 	chans      consumerBuffers
+	// sinks holds consumers registered with Channel.ConsumeSink. Unlike
+	// chans, a sink has NO per-consumer buffering goroutine: deliveries are
+	// handed directly to the handler on the connection's reader goroutine.
+	// This is what lets a single connection host thousands of consumers with
+	// O(1) goroutines instead of O(consumers). See send.
+	sinks map[string]DeliveryHandler
 }
 
 func makeConsumers() *consumers {
 	return &consumers{
 		closed: make(chan struct{}),
 		chans:  make(consumerBuffers),
+		sinks:  make(map[string]DeliveryHandler),
 	}
 }
 
@@ -124,15 +131,35 @@ func (subs *consumers) add(tag string, consumer chan Delivery) {
 	go subs.buffer(in, consumer)
 }
 
+// addSink registers a handler-based consumer. Unlike add it starts no
+// goroutine: deliveries for tag are delivered synchronously by send on the
+// reader goroutine. On key conflict any previous channel-based consumer for
+// the tag is closed first so a tag always maps to exactly one target.
+func (subs *consumers) addSink(tag string, handler DeliveryHandler) {
+	subs.Lock()
+	defer subs.Unlock()
+
+	if prev, found := subs.chans[tag]; found {
+		delete(subs.chans, tag)
+		close(prev)
+	}
+
+	subs.sinks[tag] = handler
+}
+
 func (subs *consumers) cancel(tag string) (found bool) {
 	subs.Lock()
 	defer subs.Unlock()
 
-	ch, found := subs.chans[tag]
-
-	if found {
+	if ch, ok := subs.chans[tag]; ok {
 		delete(subs.chans, tag)
 		close(ch)
+		found = true
+	}
+
+	if _, ok := subs.sinks[tag]; ok {
+		delete(subs.sinks, tag)
+		found = true
 	}
 
 	return found
@@ -149,21 +176,42 @@ func (subs *consumers) close() {
 		close(ch)
 	}
 
+	// Sinks own no goroutine, so there is nothing to signal/await; just drop
+	// the references so no further deliveries are dispatched.
+	for tag := range subs.sinks {
+		delete(subs.sinks, tag)
+	}
+
 	subs.Wait()
 }
 
-// Sends a delivery to a the consumer identified by `tag`.
-// If unbuffered channels are used for Consume this method
-// could block all deliveries until the consumer
-// receives on the other end of the channel.
+// Sends a delivery to the consumer identified by `tag`.
+//
+// For a sink consumer (Channel.ConsumeSink) the handler is invoked directly
+// on the caller's (reader) goroutine; the consumers mutex is released before
+// the call so a well-behaved (non-blocking) handler never serializes with
+// add/cancel/close and a misbehaving one cannot deadlock them. Delivery
+// ordering is preserved because dispatch is serialized on the single reader
+// goroutine.
+//
+// For a channel consumer (Channel.Consume) the delivery is sent on the
+// consumer's ingress channel while holding the mutex, as before: if
+// unbuffered channels are used this could block all deliveries until the
+// buffering goroutine receives on the other end.
 func (subs *consumers) send(tag string, msg *Delivery) bool {
 	subs.Lock()
-	defer subs.Unlock()
+
+	if handler, isSink := subs.sinks[tag]; isSink {
+		subs.Unlock()
+		handler(*msg)
+		return true
+	}
 
 	buffer, found := subs.chans[tag]
 	if found {
 		buffer <- msg
 	}
+	subs.Unlock()
 
 	return found
 }
