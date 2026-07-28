@@ -7,6 +7,7 @@ package amqp091
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -1247,6 +1248,97 @@ func (ch *Channel) ConsumeWithContext(ctx context.Context, queue, consumer strin
 	}()
 
 	return deliveries, nil
+}
+
+// DeliveryHandler is the callback invoked for every delivery of a consumer
+// registered with Channel.ConsumeSink.
+//
+// It is called SYNCHRONOUSLY on the Connection's single reader goroutine, in
+// delivery order, with no intermediate Go channel and no per-consumer
+// goroutine. This is what allows one Connection to host many thousands of
+// consumers with O(1) goroutines (the reader + heartbeater) instead of the
+// ~2 goroutines per consumer that Consume / ConsumeWithContext spawn (a
+// buffering goroutine, and for the context variant a cancel watcher).
+//
+// Because the handler runs on the reader goroutine, it MUST be fast and
+// non-blocking:
+//
+//   - A slow handler applies TCP back-pressure and stalls deliveries for
+//     EVERY consumer on the same Connection, and delays delivery of method
+//     replies the reader is responsible for dispatching.
+//   - The handler MUST NOT perform a synchronous request/response on the same
+//     Connection (anything that waits for a server reply, e.g. a *WithContext
+//     call, Qos, QueueDeclare, or Channel.Cancel of itself). The reader is
+//     busy in the handler and cannot deliver the reply, so such a call would
+//     deadlock. Delivery.Ack/Nack/Reject are safe: they only write a frame
+//     and do not wait on the reader.
+//
+// The recommended pattern is to hand the delivery to a bounded, non-blocking
+// structure (e.g. a per-topic ring buffer / broadcaster that drops on
+// overflow) and return immediately.
+type DeliveryHandler func(Delivery)
+
+/*
+ConsumeSink starts delivering queued messages to handler instead of to a Go
+channel. It is a goroutine-free alternative to Consume for callers that
+multiplex very many consumers over a single connection.
+
+ConsumeSink registers the consumer exactly like Consume (same basic.consume
+request and the same arguments), but deliveries are dispatched directly to
+handler on the connection's reader goroutine. No per-consumer buffering
+goroutine is started, so N concurrent ConsumeSink consumers cost O(1)
+goroutines rather than O(N).
+
+handler must be non-nil and must obey the contract documented on
+DeliveryHandler: it runs on the reader goroutine, must not block, and must
+not issue synchronous request/response operations on the same connection.
+
+The (possibly server-visible) consumer tag is returned so the caller can
+later Channel.Cancel it; pass a non-empty consumer to choose the tag, or ""
+to have one generated. As with Consume, all parameters other than handler
+have identical semantics to that method, including autoAck, exclusive,
+noLocal, noWait and args.
+
+When the channel or connection is closed, the handler simply stops being
+called; there is no channel to drain or close. A consumer registered with
+ConsumeSink is cancelled with Channel.Cancel using the returned tag.
+*/
+func (ch *Channel) ConsumeSink(queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args Table, handler DeliveryHandler) (string, error) {
+	// When we return from ch.call, there may be a delivery already for the
+	// consumer that hasn't been registered yet. Because of this, we never
+	// rely on the server picking a consumer tag for us.
+
+	if handler == nil {
+		return "", errors.New("amqp091: ConsumeSink requires a non-nil DeliveryHandler")
+	}
+
+	if err := args.Validate(); err != nil {
+		return "", err
+	}
+
+	if consumer == "" {
+		consumer = uniqueConsumerTag()
+	}
+
+	req := &basicConsume{
+		Queue:       queue,
+		ConsumerTag: consumer,
+		NoLocal:     noLocal,
+		NoAck:       autoAck,
+		Exclusive:   exclusive,
+		NoWait:      noWait,
+		Arguments:   args,
+	}
+	res := &basicConsumeOk{}
+
+	ch.consumers.addSink(consumer, handler)
+
+	if err := ch.call(req, res); err != nil {
+		ch.consumers.cancel(consumer)
+		return "", err
+	}
+
+	return consumer, nil
 }
 
 /*
