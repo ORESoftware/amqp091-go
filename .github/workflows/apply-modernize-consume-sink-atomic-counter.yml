@@ -84,6 +84,6 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           git diff --cached --check
-          test "$(git diff --cached --name-only)" = 'consume_sink_test.go'
+          test "$(git diff --cached --name-only | sort)" = $'.github/workflows/apply-modernize-consume-sink-atomic-counter.yml\nconsume_sink_test.go'
           git commit -m 'test: modernize ConsumeSink atomic counter'
           git push origin HEAD:fix/modernize-consume-sink-atomic-counter
