@@ -250,10 +250,10 @@ func TestConsumeSink_CancelStopsDelivery(t *testing.T) {
 		t.Fatalf("channel: %v", err)
 	}
 
-	var count int64
+	var count atomic.Int64
 	got := make(chan Delivery, 4)
 	if _, err := ch.ConsumeSink("queue", tag, true, false, false, false, nil, func(d Delivery) {
-		atomic.AddInt64(&count, 1)
+		count.Add(1)
 		got <- d
 	}); err != nil {
 		t.Fatalf("ConsumeSink: %v", err)
@@ -279,7 +279,7 @@ func TestConsumeSink_CancelStopsDelivery(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 	}
 
-	if got := atomic.LoadInt64(&count); got != 1 {
+	if got := count.Load(); got != 1 {
 		t.Fatalf("handler called %d times, want 1", got)
 	}
 
