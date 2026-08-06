@@ -12,3 +12,7 @@ _examples/pubsub/pubsub
 
 # IDEs and Editors
 .idea/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
